@@ -1,0 +1,1020 @@
+// Package nest provides a flexible configuration management system for Skink
+// applications. It supports loading configuration from environment variables
+// and configuration files (JSON, YAML, XML) with a cascading priority system
+// where file values take precedence over environment variables, which take
+// precedence over default values.
+//
+// Author: Mark Oxley
+//
+// This is a port of the Go "nest" module (github.com/markoxley/nest). Go
+// struct tags are expressed with Skink's [attr] field annotations:
+//
+//   [env(VAR_NAME,default)]  - Environment variable name and optional default
+//   [env(-)]                 - Exclude field from environment loading
+//   [json(name=x)]           - JSON key name (also [json(x)] positional form)
+//   [json(ignore)]           - Exclude field from JSON loading
+//   [yaml(name=x)]           - YAML key name (also [yaml(x)] positional form)
+//   [yaml(ignore)]           - Exclude field from YAML loading
+//   [xml(name=x)]            - XML element name (also [xml(x)] positional form)
+//   [xml(ignore)]            - Exclude field from XML loading
+//   [nest(ptr)]              - Marks a *Struct field (see Nested structs)
+//
+// Example usage:
+//
+//   struct Config {
+//       [env(APP_HOST,localhost)] [json(name=host)] [yaml(name=host)]
+//       host: string
+//       [env(APP_PORT,8080)] [json(name=port)] [yaml(name=port)]
+//       port: string
+//   }
+//
+//   var cfg Config
+//   t := reflect.TypeOf<Config>(cfg)
+//   err := nest.Load(t, int64(&cfg), "", []string{"config.json"})
+//
+// Configuration loading follows this priority order (highest to lowest):
+//  1. Configuration file values (if present in file)
+//  2. Environment variable values
+//  3. Default values from field tags
+//  4. Zero values for the type
+//
+// Nested structs: because generic type parameters are erased, a reflect.Type
+// cannot enumerate the fields of a struct-typed field from its name alone.
+// Call Register once for each nested struct type so the loaders can recurse:
+//
+//   nest.Register(reflect.TypeOf<DatabaseConfig>(DatabaseConfig{}))
+//
+// Pointer fields: reflected type names distinguish "*Struct" pointer fields
+// from "Struct" inline fields and "[]T" slice fields, so nest auto-detects
+// them — a nil *Struct field is heap-allocated and zeroed before loading.
+// The [nest(ptr)] annotation is accepted for compatibility but is no longer
+// required. Slice, map, set, and pointer-to-primitive fields are unsupported.
+module nest
+
+import "std/errors"
+import "std/fs"
+import "std/json"
+import "std/yaml"
+import "std/xml"
+import "std/libc"
+import "std/log"
+import "std/os"
+import "std/path"
+import "std/reflect"
+import "std/str"
+import "std/strconv"
+
+// Supported configuration file format constants.
+const FileTypeJSON = ".json"
+const FileTypeXML = ".xml"
+const FileTypeYAML = ".yaml"
+
+// registeredTypes holds every struct type passed to Register, allowing the
+// recursive loaders to resolve a field's type_name back to field metadata.
+var registeredTypes []reflect.Type
+
+// Register makes a struct type available for nested-struct traversal.
+// Call it once per nested (section) struct type before using Load,
+// ListEnvironmentVariables, or CreateDefaultConfig. Registering the same
+// type name twice is a no-op.
+pub fn Register(t: reflect.Type) {
+    for i := 0; i < len(registeredTypes); i = i + 1 {
+        if str.Equal(registeredTypes[i].name, t.name) {
+            return
+        }
+    }
+    registeredTypes = append(registeredTypes, t)
+}
+
+// lookupRegistered resolves a field type_name to a registered struct type.
+// Field type names may carry a module qualifier ("mod_Type") or a trailing
+// "*" in older metadata; both are normalised before matching. Callers that
+// need pointer-awareness should use fieldStruct instead.
+fn lookupRegistered(typeName: string) -> (reflect.Type, bool) {
+    tn := typeName
+    for str.EndsWith(tn, "*") {
+        tn = str.Substr(tn, 0, str.Len(tn) - 1)
+    }
+    for i := 0; i < len(registeredTypes); i = i + 1 {
+        rn := registeredTypes[i].name
+        if str.Equal(tn, rn) || str.EndsWith(tn, str.Concat("_", rn)) {
+            return registeredTypes[i], true
+        }
+    }
+    return reflect.Type{}, false
+}
+
+// fieldStruct resolves f to the registered struct type nest should recurse
+// into. An inline struct field resolves directly; a "*T" pointer field
+// resolves through its pointee name and is auto-allocated when nil
+// (reflected type names distinguish "*T" pointers from "[]T" slices, so
+// pointer detection is safe). Slice, map, and set fields never resolve —
+// they remain unsupported leaf fields.
+fn fieldStruct(f: reflect.Field) -> (reflect.Type, bool) {
+    tn := f.type_name
+    if reflect.IsPointer(f) {
+        tn = reflect.ElemType(f)
+    }
+    return lookupRegistered(tn)
+}
+
+// scalarType reports whether typeName is a leaf field type nest can assign:
+// int, int64, string, float, or bool (the same set supported by std/json's
+// struct marshalling and std/orm).
+fn scalarType(typeName: string) -> bool {
+    return str.Equal(typeName, "int") || str.Equal(typeName, "int64") ||
+        str.Equal(typeName, "string") || str.Equal(typeName, "float") ||
+        str.Equal(typeName, "bool")
+}
+
+// attrArgs extracts the argument text of `want(...)` inside a space-joined
+// field tag, e.g. attrArgs("env(HOST,x) json(name=h)", "env") is "HOST,x".
+// A bare attribute (no parentheses) returns ("", true). Attributes whose
+// arguments contain spaces are handled because scanning runs to the closing
+// parenthesis rather than the next space.
+fn attrArgs(tag: string, want: string) -> (string, bool) {
+    n := str.Len(tag)
+    i := 0
+    for i < n {
+        for i < n && tag[i] == 32 {
+            i = i + 1
+        }
+        if i >= n {
+            break
+        }
+        j := i
+        for j < n && tag[j] != 32 && tag[j] != 40 {
+            j = j + 1
+        }
+        name := str.Substr(tag, i, j - i)
+        if j < n && tag[j] == 40 {
+            k := j + 1
+            for k < n && tag[k] != 41 {
+                k = k + 1
+            }
+            args := str.Substr(tag, j + 1, k - j - 1)
+            if str.Equal(name, want) {
+                return args, true
+            }
+            i = k + 1
+        } else {
+            if str.Equal(name, want) {
+                return "", true
+            }
+            i = j
+        }
+    }
+    return "", false
+}
+
+// positionalName returns the first positional flag inside attr(...) that is
+// not a keyword — e.g. positionalName("json(x,omitempty)", "json") is "x".
+// A "-" flag is returned verbatim so callers can treat it like Go's `json:"-"`
+// (field excluded / name falls back to the next source). Returns "" when the
+// attribute has no positional name.
+fn positionalName(tag: string, attr: string) -> string {
+    flags := reflect.TagFlags(tag, attr)
+    for i := 0; i < len(flags); i = i + 1 {
+        fl := flags[i]
+        if str.Equal(fl, "ignore") || str.Equal(fl, "omitempty") ||
+           str.Contains(fl, "=") {
+            continue
+        }
+        return fl
+    }
+    return ""
+}
+
+// unsupportedErr builds the error returned when a value targets a field
+// whose type nest cannot assign (slices, maps, sets, primitive pointers,
+// functions, etc.).
+fn unsupportedErr(f: reflect.Field) -> errors.Error {
+    return errors.New(str.Concat("nest: unsupported field type \"",
+        str.Concat(f.type_name, str.Concat("\" on field \"",
+        str.Concat(f.name, "\"")))))
+}
+
+// unresolvedTypeName returns the named non-scalar type a field resolves to
+// when it cannot be loaded — the field's own type name for inline fields,
+// or the pointee name for "*T" pointer fields — so callers can report the
+// type that needs a nest.Register call. Returns false for scalars,
+// pointer-to-primitive fields, slices, maps, and other unsupported
+// spellings.
+fn unresolvedTypeName(f: reflect.Field) -> (string, bool) {
+    tn := f.type_name
+    if reflect.IsPointer(f) {
+        tn = reflect.ElemType(f)
+    }
+    if isNamedNonScalar(tn) {
+        return tn, true
+    }
+    return "", false
+}
+
+// unregisteredErr builds the error returned when a struct-typed field's type
+// was not registered via nest.Register.
+fn unregisteredErr(typeName: string) -> errors.Error {
+    return errors.New(str.Concat("nest: unregistered struct type \"",
+        str.Concat(typeName, "\" — call nest.Register for nested structs")))
+}
+
+// primitiveType reports whether typeName is a built-in primitive type that
+// is not one of the assignable scalars — e.g. int8, uint32, bytes. These
+// should produce "unsupported field type" errors, never "unregistered
+// struct" ones.
+fn primitiveType(typeName: string) -> bool {
+    return scalarType(typeName) ||
+        str.Equal(typeName, "int8") || str.Equal(typeName, "int16") ||
+        str.Equal(typeName, "int32") || str.Equal(typeName, "uint") ||
+        str.Equal(typeName, "uint8") || str.Equal(typeName, "uint16") ||
+        str.Equal(typeName, "uint32") || str.Equal(typeName, "uint64") ||
+        str.Equal(typeName, "byte") || str.Equal(typeName, "bytes") ||
+        str.Equal(typeName, "double") || str.Equal(typeName, "char") ||
+        str.Equal(typeName, "void")
+}
+
+// isNamedNonScalar reports whether typeName looks like a struct type that is
+// not registered, i.e. a bare identifier rather than a scalar or a pointer/
+// slice spelling such as "i8*" or "*int".
+fn isNamedNonScalar(typeName: string) -> bool {
+    if primitiveType(typeName) {
+        return false
+    }
+    for i := 0; i < str.Len(typeName); i = i + 1 {
+        c := typeName[i]
+        isAlpha := (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+        isDigit := c >= 48 && c <= 57
+        if !isAlpha && !isDigit && c != 95 {
+            return false
+        }
+    }
+    return str.Len(typeName) > 0
+}
+
+// allocZeroed allocates size zeroed bytes and returns the address as int64.
+// Used to initialise nil *Struct fields marked [nest(ptr)].
+fn allocZeroed(size: int) -> int64 {
+    p := libc.malloc(size)
+    libc.memset(p, 0, size)
+    return int64(p)
+}
+
+// structFieldPtr returns the base address of a nested struct field: inline
+// for value fields, or the (possibly freshly allocated) pointee for *Struct
+// fields, which reflect.IsPointer identifies by the "*" type-name prefix.
+fn structFieldPtr(ptr: int64, f: reflect.Field, nt: reflect.Type) -> int64 {
+    if reflect.IsPointer(f) {
+        p := reflect.GetPtr(ptr, f)
+        if p == 0 {
+            p = allocZeroed(nt.size)
+            reflect.SetPtr(ptr, f, p)
+        }
+        return p
+    }
+    return ptr + int64(f.offset)
+}
+
+// fieldKey resolves the config-file key for a field under the given tag
+// attribute ("json", "yaml", or "xml"). The name comes from attr(name=x),
+// the first positional flag (e.g. [json(x)]), or the field name itself.
+// The bool result is false when the field is excluded ([attr(ignore)] or a
+// positional "-" flag, mirroring Go's `json:"-"`).
+fn fieldKey(f: reflect.Field, attr: string) -> (string, bool) {
+    if reflect.TagHasFlag(f.tag, attr, "ignore") {
+        return "", false
+    }
+    name, ok := reflect.TagKey(f.tag, attr, "name")
+    if ok {
+        return name, true
+    }
+    p := positionalName(f.tag, attr)
+    if str.Equal(p, "-") {
+        return "", false
+    }
+    if str.Len(p) > 0 {
+        return p, true
+    }
+    return f.name, true
+}
+
+// setFieldString assigns a textual value (environment variable, XML element
+// text, or an env-tag default) to the field, converting to the declared
+// field type. String fields keep the raw text; int/int64/float/bool fields
+// are parsed and a parse failure is returned as an error.
+fn setFieldString(ptr: int64, f: reflect.Field, val: string) -> errors.Error {
+    tn := f.type_name
+    if str.Equal(tn, "string") {
+        reflect.SetString(ptr, f, val)
+        return errors.None()
+    }
+    if str.Equal(tn, "int") {
+        n, ok := strconv.ParseInt(val)
+        if !ok {
+            return errors.New(str.Concat("nest: invalid int value \"",
+                str.Concat(val, str.Concat("\" for field \"",
+                str.Concat(f.name, "\"")))))
+        }
+        reflect.SetInt(ptr, f, n)
+        return errors.None()
+    }
+    if str.Equal(tn, "int64") {
+        n, ok := strconv.ParseInt64(val)
+        if !ok {
+            return errors.New(str.Concat("nest: invalid int64 value \"",
+                str.Concat(val, str.Concat("\" for field \"",
+                str.Concat(f.name, "\"")))))
+        }
+        reflect.SetInt64(ptr, f, n)
+        return errors.None()
+    }
+    if str.Equal(tn, "float") {
+        v, ok := strconv.ParseFloat(val)
+        if !ok {
+            return errors.New(str.Concat("nest: invalid float value \"",
+                str.Concat(val, str.Concat("\" for field \"",
+                str.Concat(f.name, "\"")))))
+        }
+        reflect.SetFloat(ptr, f, v)
+        return errors.None()
+    }
+    if str.Equal(tn, "bool") {
+        v, ok := strconv.ParseBool(val)
+        if !ok {
+            return errors.New(str.Concat("nest: invalid bool value \"",
+                str.Concat(val, str.Concat("\" for field \"",
+                str.Concat(f.name, "\"")))))
+        }
+        reflect.SetBool(ptr, f, v)
+        return errors.None()
+    }
+    if utn, bad := unresolvedTypeName(f); bad {
+        return unregisteredErr(utn)
+    }
+    return unsupportedErr(f)
+}
+
+// typeMismatch builds the error for a JSON value of the wrong kind.
+fn typeMismatch(f: reflect.Field, want: string) -> errors.Error {
+    return errors.New(str.Concat("nest: cannot assign config value to field \"",
+        str.Concat(f.name, str.Concat("\" — expected ",
+        str.Concat(want, str.Concat(" for type \"",
+        str.Concat(f.type_name, "\"")))))))
+}
+
+// setFieldJSON assigns a parsed JSON/YAML scalar to the field, enforcing the
+// kind checks Go's encoding/json would (a number cannot load into a string
+// field, etc.). yaml.Value trees are normalised to json.Value by yamlToJSON
+// before reaching this function.
+fn setFieldJSON(ptr: int64, f: reflect.Field, v: json.Value) -> errors.Error {
+    tn := f.type_name
+    if str.Equal(tn, "string") {
+        if v.kind != 3 {
+            return typeMismatch(f, "a JSON string")
+        }
+        reflect.SetString(ptr, f, json.AsString(v))
+        return errors.None()
+    }
+    if str.Equal(tn, "bool") {
+        if v.kind != 1 {
+            return typeMismatch(f, "a JSON bool")
+        }
+        reflect.SetBool(ptr, f, json.AsBool(v))
+        return errors.None()
+    }
+    if str.Equal(tn, "int") {
+        if v.kind != 2 {
+            return typeMismatch(f, "a JSON number")
+        }
+        reflect.SetInt(ptr, f, int(json.AsNumber(v)))
+        return errors.None()
+    }
+    if str.Equal(tn, "int64") {
+        if v.kind != 2 {
+            return typeMismatch(f, "a JSON number")
+        }
+        reflect.SetInt64(ptr, f, int64(json.AsNumber(v)))
+        return errors.None()
+    }
+    if str.Equal(tn, "float") {
+        if v.kind != 2 {
+            return typeMismatch(f, "a JSON number")
+        }
+        reflect.SetFloat(ptr, f, json.AsNumber(v))
+        return errors.None()
+    }
+    if utn, bad := unresolvedTypeName(f); bad {
+        return unregisteredErr(utn)
+    }
+    return unsupportedErr(f)
+}
+
+// Load populates the configuration struct at ptr by loading values from
+// environment variables and optionally from a configuration file.
+//
+// The loading process follows this order:
+//  1. Environment variables are loaded first, applying default values from
+//     field tags when environment variables are not set
+//  2. If a filename is provided, the configuration file is loaded and its
+//     values overwrite fields that are present in the file
+//
+// Parameters:
+//   - t: reflect.TypeOf<T> for the configuration struct type
+//   - ptr: int64(&cfg), a pointer to the configuration struct to populate;
+//     must be non-zero
+//   - prefix: Top-level prefix for environment variable names (e.g., "APP"
+//     results in "APP_HOST"). Use "" for no prefix.
+//   - files: Optional filename(s). If provided, the first file is loaded.
+//     A second filename can be provided to override the file type detection;
+//     it may be given with or without a leading dot ("json" or ".json").
+//
+// Returns an error if:
+//   - ptr is zero
+//   - The configuration file cannot be read or parsed
+//   - The file type is not supported
+//   - A value cannot be converted to its field's type
+//   - A nested struct field's type was not registered via Register
+//
+// Example:
+//
+//   var cfg Config
+//   t := reflect.TypeOf<Config>(cfg)
+//   err := nest.Load(t, int64(&cfg), "", []string{})                    // env only
+//   err := nest.Load(t, int64(&cfg), "APP", []string{"app.json"})       // env + JSON file
+//   err := nest.Load(t, int64(&cfg), "", []string{"config", "yaml"})    // explicit file type
+pub fn Load(t: reflect.Type, ptr: int64, prefix: string, files: []string) -> errors.Error {
+    if ptr == 0 {
+        return errors.New("nest: config is nil")
+    }
+    err := loadEnvironmentVariables(t, ptr, prefix)
+    if err.message != "" {
+        return err
+    }
+    if len(files) > 0 {
+        return loadFile(t, ptr, files)
+    }
+    return errors.None()
+}
+
+// MustLoad is a convenience wrapper around Load that terminates the program
+// (via log.Fatal) if an error occurs during configuration loading.
+//
+// Use this function when configuration is required for application startup
+// and failure to load should terminate the program immediately.
+pub fn MustLoad(t: reflect.Type, ptr: int64, prefix: string, files: []string) {
+    err := Load(t, ptr, prefix, files)
+    if err.message != "" {
+        log.Fatal(err.message)
+    }
+}
+
+// loadEnvironmentVariables recursively loads configuration values from
+// environment variables into the struct at ptr. It uses the env field tag
+// to determine the environment variable name and optional default value.
+//
+// The env tag format is: [env(VAR_NAME,default)] or [env(-)] to skip.
+//
+// For nested (registered) structs, the function builds a prefixed
+// environment variable name (e.g., DATABASE_HOST for a nested database
+// struct with a host field).
+fn loadEnvironmentVariables(t: reflect.Type, ptr: int64, pfx: string) -> errors.Error {
+    // Build prefix for nested struct field names (e.g., "DATABASE_")
+    if str.Len(pfx) > 0 && !str.EndsWith(pfx, "_") {
+        pfx = str.Concat(pfx, "_")
+    }
+    n := reflect.FieldCount(t)
+    for i := 0; i < n; i = i + 1 {
+        f := reflect.FieldByIndex(t, i)
+        fieldName := f.name
+        hasDefault := false
+        defaultValue := ""
+        envArgs, hasEnv := attrArgs(f.tag, "env")
+        if hasEnv {
+            if str.Equal(envArgs, "-") {
+                continue
+            }
+            parts := str.Split(envArgs, ",")
+            if len(parts) > 1 {
+                hasDefault = true
+                defaultValue = parts[1]
+            }
+            if len(parts) > 0 && str.Len(parts[0]) > 0 {
+                fieldName = parts[0]
+            }
+        }
+        // Recurse into nested structs (registered types only)
+        nt, isStruct := fieldStruct(f)
+        if isStruct {
+            err := loadEnvironmentVariables(nt, structFieldPtr(ptr, f, nt),
+                str.Concat(pfx, fieldName))
+            if err.message != "" {
+                return err
+            }
+            continue
+        }
+        if utn, bad := unresolvedTypeName(f); bad {
+            return unregisteredErr(utn)
+        }
+        // Check for environment variable value
+        value := os.Getenv(str.ToUpper(str.Concat(pfx, fieldName)))
+        if str.Len(value) > 0 {
+            // Environment variable takes precedence
+            err := setFieldString(ptr, f, value)
+            if err.message != "" {
+                return err
+            }
+            continue
+        }
+        // Fall back to default value from tag if provided
+        if hasDefault {
+            err := setFieldString(ptr, f, defaultValue)
+            if err.message != "" {
+                return err
+            }
+        }
+    }
+    return errors.None()
+}
+
+// normalizeExt returns s as a lowercase dotted file extension, accepting
+// both "json" and ".json" style type specifiers.
+fn normalizeExt(s: string) -> string {
+    e := s
+    if str.Len(e) > 0 && e[0] != 46 {
+        e = str.Concat(".", e)
+    }
+    return str.ToLower(e)
+}
+
+// loadFile reads a configuration file and populates the struct at ptr with
+// values from the file. Only fields present in the file are updated; other
+// fields retain their current values (from environment or defaults).
+//
+// Supported file formats: JSON (.json), YAML (.yaml, .yml), XML (.xml)
+//
+// Parameters:
+//   - f: Filename(s). First element is the file path. A second optional
+//     element explicitly specifies the file type.
+fn loadFile(t: reflect.Type, ptr: int64, f: []string) -> errors.Error {
+    if len(f) == 0 {
+        return errors.None()
+    }
+    ext := normalizeExt(path.Ext(f[0]))
+    if len(f) > 1 {
+        ext = normalizeExt(f[1])
+    }
+    if str.Equal(ext, ".yml") {
+        ext = ".yaml"
+    }
+    data, rerr := fs.ReadAll(f[0])
+    if rerr.message != "" {
+        return errors.New(str.Concat("nest: cannot read config file \"",
+            str.Concat(f[0], str.Concat("\": ", rerr.message))))
+    }
+    if str.Equal(ext, FileTypeJSON) {
+        return applyJSONFile(data, t, ptr)
+    }
+    if str.Equal(ext, FileTypeYAML) {
+        return applyYAMLFile(data, t, ptr)
+    }
+    if str.Equal(ext, FileTypeXML) {
+        return applyXMLFile(data, t, ptr)
+    }
+    return errors.New(str.Concat("nest: unsupported file type: ", ext))
+}
+
+// applyJSONFile parses a JSON document and applies the fields present in it
+// to the struct at ptr. A JSON null document is a no-op (matching Go's
+// behaviour when unmarshalling null into a map); a non-object document is
+// an error.
+fn applyJSONFile(data: string, t: reflect.Type, ptr: int64) -> errors.Error {
+    v, err := json.Unmarshal(data)
+    if err.message != "" {
+        return err
+    }
+    if json.IsNull(v) {
+        return errors.None()
+    }
+    if v.kind != 5 {
+        return errors.New("nest: expected a JSON object in config file")
+    }
+    return applyJSONObject(v, t, ptr)
+}
+
+// applyJSONObject writes each matching key of a JSON object value into the
+// struct at ptr. Keys not present leave their fields unchanged; object keys
+// with no matching field are ignored.
+fn applyJSONObject(v: json.Value, t: reflect.Type, ptr: int64) -> errors.Error {
+    n := reflect.FieldCount(t)
+    for i := 0; i < n; i = i + 1 {
+        f := reflect.FieldByIndex(t, i)
+        name, include := fieldKey(f, "json")
+        if !include {
+            continue
+        }
+        fv := json.ObjectGet(v, name)
+        if json.IsNull(fv) {
+            continue
+        }
+        nt, isStruct := fieldStruct(f)
+        if isStruct {
+            if fv.kind != 5 {
+                return typeMismatch(f, "a JSON object")
+            }
+            err := applyJSONObject(fv, nt, structFieldPtr(ptr, f, nt))
+            if err.message != "" {
+                return err
+            }
+            continue
+        }
+        err := setFieldJSON(ptr, f, fv)
+        if err.message != "" {
+            return err
+        }
+    }
+    return errors.None()
+}
+
+// applyYAMLFile parses a YAML document, normalises it to a JSON value tree,
+// and applies it to the struct at ptr. A YAML null/empty document is a
+// no-op; a non-mapping document is an error.
+fn applyYAMLFile(data: string, t: reflect.Type, ptr: int64) -> errors.Error {
+    v, err := yaml.Unmarshal(data)
+    if err.message != "" {
+        return err
+    }
+    if yaml.IsNull(v) {
+        return errors.None()
+    }
+    jv := yamlToJSON(v)
+    if jv.kind != 5 {
+        return errors.New("nest: expected a YAML mapping in config file")
+    }
+    return applyJSONObject(jv, t, ptr)
+}
+
+// yamlToJSON converts a yaml.Value tree to the identically-shaped
+// json.Value tree so the two formats share one apply path.
+fn yamlToJSON(v: yaml.Value) -> json.Value {
+    if v.kind == 1 {
+        return json.FromBool(yaml.AsBool(v))
+    }
+    if v.kind == 2 {
+        return json.FromNumber(yaml.AsNumber(v))
+    }
+    if v.kind == 3 {
+        return json.FromString(yaml.AsString(v))
+    }
+    if v.kind == 4 {
+        var arr []json.Value
+        for i := 0; i < yaml.ArrayLen(v); i = i + 1 {
+            arr = append(arr, yamlToJSON(yaml.ArrayGet(v, i)))
+        }
+        return json.FromArray(arr)
+    }
+    if v.kind == 5 {
+        var keys []string
+        var vals []json.Value
+        for i := 0; i < yaml.ObjectLen(v); i = i + 1 {
+            k, val := yaml.ObjectGetByIndex(v, i)
+            keys = append(keys, k)
+            vals = append(vals, yamlToJSON(val))
+        }
+        return json.FromObject(keys, vals)
+    }
+    return json.Null()
+}
+
+// applyXMLFile parses an XML document and applies child elements of the
+// root to matching fields of the struct at ptr.
+fn applyXMLFile(data: string, t: reflect.Type, ptr: int64) -> errors.Error {
+    node, err := xml.Unmarshal(data)
+    if err.message != "" {
+        return err
+    }
+    return applyXMLNode(node, t, ptr)
+}
+
+// applyXMLNode writes the text of child elements whose tag matches each
+// field's xml name into the struct at ptr. Nested struct fields recurse
+// into the matching child element.
+fn applyXMLNode(node: xml.Node, t: reflect.Type, ptr: int64) -> errors.Error {
+    n := reflect.FieldCount(t)
+    for i := 0; i < n; i = i + 1 {
+        f := reflect.FieldByIndex(t, i)
+        name, include := fieldKey(f, "xml")
+        if !include {
+            continue
+        }
+        child := findXMLChild(node, name)
+        if str.Len(child.tag) == 0 {
+            continue
+        }
+        nt, isStruct := fieldStruct(f)
+        if isStruct {
+            err := applyXMLNode(child, nt, structFieldPtr(ptr, f, nt))
+            if err.message != "" {
+                return err
+            }
+            continue
+        }
+        if utn, bad := unresolvedTypeName(f); bad {
+            return unregisteredErr(utn)
+        }
+        err := setFieldString(ptr, f, child.text)
+        if err.message != "" {
+            return err
+        }
+    }
+    return errors.None()
+}
+
+// findXMLChild returns the first direct child element of node whose tag
+// equals name, trying an exact match first and a case-insensitive match
+// second (Go's encoding/xml matches field names case-insensitively).
+// A Node with an empty tag is returned when no child matches.
+fn findXMLChild(node: xml.Node, name: string) -> xml.Node {
+    for i := 0; i < len(node.children); i = i + 1 {
+        if str.Equal(node.children[i].tag, name) {
+            return node.children[i]
+        }
+    }
+    lower := str.ToLower(name)
+    for i := 0; i < len(node.children); i = i + 1 {
+        if str.Equal(str.ToLower(node.children[i].tag), lower) {
+            return node.children[i]
+        }
+    }
+    return xml.NewNode("")
+}
+
+// ListEnvironmentVariables returns a map of all environment variables that
+// would be loaded for the given configuration struct type. The map keys are
+// the environment variable names, and the values are the default values
+// from the field tags (empty string if no default is specified).
+//
+// This function is useful for documentation and discovery purposes, showing
+// operators which environment variables the application recognizes.
+//
+// For nested structs, environment variable names are prefixed (e.g.,
+// "DATABASE_HOST"). Nested struct types must be registered via Register.
+// Unlike the Go version (which skips nil *Struct fields at list time), this
+// type-level listing always includes registered nested types.
+//
+// Example output:
+//
+//   {
+//       "APP_HOST": "localhost",
+//       "APP_PORT": "8080",
+//       "DATABASE_HOST": "localhost",
+//   }
+//
+// Returns the map plus an error when a nested struct field's type was not
+// registered.
+pub fn ListEnvironmentVariables(t: reflect.Type, prefix: string) -> (map[string]string, errors.Error) {
+    result := make(map[string]string)
+    err := listEnvVarsRecursive(t, prefix, result)
+    return result, err
+}
+
+// listEnvVarsRecursive recursively traverses the configuration struct type
+// to build a map of environment variable names to default values.
+fn listEnvVarsRecursive(t: reflect.Type, pfx: string, result: map[string]string) -> errors.Error {
+    if str.Len(pfx) > 0 && !str.EndsWith(pfx, "_") {
+        pfx = str.Concat(pfx, "_")
+    }
+    n := reflect.FieldCount(t)
+    for i := 0; i < n; i = i + 1 {
+        f := reflect.FieldByIndex(t, i)
+        fieldName := f.name
+        defaultValue := ""
+        envArgs, hasEnv := attrArgs(f.tag, "env")
+        if hasEnv {
+            if str.Equal(envArgs, "-") {
+                continue
+            }
+            parts := str.Split(envArgs, ",")
+            if len(parts) > 1 {
+                defaultValue = parts[1]
+            }
+            if len(parts) > 0 && str.Len(parts[0]) > 0 {
+                fieldName = parts[0]
+            }
+        }
+        envName := str.ToUpper(str.Concat(pfx, fieldName))
+        nt, isStruct := fieldStruct(f)
+        if isStruct {
+            err := listEnvVarsRecursive(nt, envName, result)
+            if err.message != "" {
+                return err
+            }
+            continue
+        }
+        if utn, bad := unresolvedTypeName(f); bad {
+            return unregisteredErr(utn)
+        }
+        // Record the environment variable if it has an env tag
+        if hasEnv {
+            result[envName] = defaultValue
+        }
+    }
+    return errors.None()
+}
+
+// CreateDefaultConfig creates a configuration file containing default
+// values extracted from the field tags. This is useful for generating
+// sample configuration files or initial setup templates.
+//
+// The function extracts default values from the env field tags (the part
+// after the comma). For fields without a default value, an empty string is
+// used. Only fields carrying an env tag are included.
+//
+// Parameters:
+//   - t: reflect.TypeOf<T> for the configuration struct type
+//   - filename: The path where the configuration file will be created
+//   - filetype: Explicit file type ("json", "yaml", "yml"); pass "" to infer
+//     the type from the filename extension.
+//
+// Supported formats:
+//   - JSON (.json)
+//   - YAML (.yaml, .yml)
+//   - Note: XML creation is not supported (matching the Go version)
+//
+// Example:
+//
+//   t := reflect.TypeOf<Config>(cfg)
+//   err := nest.CreateDefaultConfig(t, "config.json")
+//   err := nest.CreateDefaultConfig(t, "config.yaml", "")
+//   err := nest.CreateDefaultConfig(t, "myconfig", "json")
+pub fn CreateDefaultConfig(t: reflect.Type, filename: string, filetype: string) -> errors.Error {
+    ext := ""
+    if str.Len(filetype) > 0 {
+        ext = filetype
+        if !str.StartsWith(ext, ".") {
+            ext = str.Concat(".", ext)
+        }
+    } else {
+        ext = str.ToLower(path.Ext(filename))
+    }
+    if str.Equal(ext, ".yml") {
+        ext = ".yaml"
+    }
+    defaults := buildDefaults(t)
+    content := ""
+    if str.Equal(ext, FileTypeJSON) {
+        content = marshalJSONPretty(defaults, 0)
+    } else if str.Equal(ext, FileTypeYAML) {
+        content = yaml.MarshalValue(jsonToYAML(defaults))
+    } else if str.Equal(ext, FileTypeXML) {
+        return errors.New("nest: XML default config creation not yet supported")
+    } else {
+        return errors.New(str.Concat("nest: unsupported file type: ", ext))
+    }
+    return fs.WriteAll(filename, content)
+}
+
+// defaultsKey resolves the output key for a field in generated default
+// configs, preferring a json tag name, then a yaml tag name, then the field
+// name — matching the Go implementation, where `json:"-"`/`[json(ignore)]`
+// falls through to the yaml tag rather than excluding the field.
+fn defaultsKey(f: reflect.Field) -> string {
+    if jk, jok := reflect.TagKey(f.tag, "json", "name"); jok {
+        return jk
+    }
+    if !reflect.TagHasFlag(f.tag, "json", "ignore") {
+        p := positionalName(f.tag, "json")
+        if str.Len(p) > 0 && !str.Equal(p, "-") {
+            return p
+        }
+    }
+    if yk, yok := reflect.TagKey(f.tag, "yaml", "name"); yok {
+        return yk
+    }
+    if !reflect.TagHasFlag(f.tag, "yaml", "ignore") {
+        p := positionalName(f.tag, "yaml")
+        if str.Len(p) > 0 && !str.Equal(p, "-") {
+            return p
+        }
+    }
+    return f.name
+}
+
+// buildDefaults recursively builds a JSON object tree of default
+// configuration values from the env field tags. Nested (registered) struct
+// fields become nested objects; json/yaml tag names are honoured for keys.
+fn buildDefaults(t: reflect.Type) -> json.Value {
+    var keys []string
+    var vals []json.Value
+    n := reflect.FieldCount(t)
+    for i := 0; i < n; i = i + 1 {
+        f := reflect.FieldByIndex(t, i)
+        fieldName := defaultsKey(f)
+        // Recursively handle nested structs
+        nt, isStruct := fieldStruct(f)
+        if isStruct {
+            nested := buildDefaults(nt)
+            if json.ObjectLen(nested) > 0 {
+                keys = append(keys, fieldName)
+                vals = append(vals, nested)
+            }
+            continue
+        }
+        if _, bad := unresolvedTypeName(f); bad {
+            continue
+        }
+        // Extract default value from env tag (part after the comma)
+        envArgs, hasEnv := attrArgs(f.tag, "env")
+        if hasEnv {
+            if str.Equal(envArgs, "-") {
+                continue
+            }
+            parts := str.Split(envArgs, ",")
+            if len(parts) > 1 {
+                vals = append(vals, json.FromString(parts[1]))
+            } else {
+                vals = append(vals, json.FromString(""))
+            }
+            keys = append(keys, fieldName)
+        }
+    }
+    return json.FromObject(keys, vals)
+}
+
+// jsonToYAML converts a json.Value tree to the identically-shaped
+// yaml.Value tree for YAML serialization of default configs.
+fn jsonToYAML(v: json.Value) -> yaml.Value {
+    if v.kind == 1 {
+        return yaml.FromBool(json.AsBool(v))
+    }
+    if v.kind == 2 {
+        return yaml.FromNumber(json.AsNumber(v))
+    }
+    if v.kind == 3 {
+        return yaml.FromString(json.AsString(v))
+    }
+    if v.kind == 4 {
+        var arr []yaml.Value
+        for i := 0; i < json.ArrayLen(v); i = i + 1 {
+            arr = append(arr, jsonToYAML(json.ArrayGet(v, i)))
+        }
+        return yaml.FromArray(arr)
+    }
+    if v.kind == 5 {
+        var keys []string
+        var vals []yaml.Value
+        for i := 0; i < json.ObjectLen(v); i = i + 1 {
+            k, val := json.ObjectGetByIndex(v, i)
+            keys = append(keys, k)
+            vals = append(vals, jsonToYAML(val))
+        }
+        return yaml.FromObject(keys, vals)
+    }
+    return yaml.Null()
+}
+
+// marshalJSONPretty serializes a json.Value with two-space indentation,
+// mirroring Go's json.MarshalIndent for generated default config files.
+// Scalar values delegate to json.MarshalValue.
+fn marshalJSONPretty(v: json.Value, indent: int) -> string {
+    if v.kind == 4 {
+        if json.ArrayLen(v) == 0 {
+            return "[]"
+        }
+        res := "[\n"
+        for i := 0; i < json.ArrayLen(v); i = i + 1 {
+            if i > 0 {
+                res = str.Concat(res, ",\n")
+            }
+            res = str.Concat(res, indentStr(indent + 2))
+            res = str.Concat(res, marshalJSONPretty(json.ArrayGet(v, i), indent + 2))
+        }
+        res = str.Concat(res, str.Concat("\n", str.Concat(indentStr(indent), "]")))
+        return res
+    }
+    if v.kind == 5 {
+        if json.ObjectLen(v) == 0 {
+            return "{}"
+        }
+        res := "{\n"
+        for i := 0; i < json.ObjectLen(v); i = i + 1 {
+            if i > 0 {
+                res = str.Concat(res, ",\n")
+            }
+            k, val := json.ObjectGetByIndex(v, i)
+            res = str.Concat(res, indentStr(indent + 2))
+            res = str.Concat(res, str.Concat("\"",
+                str.Concat(k, str.Concat("\": ", marshalJSONPretty(val, indent + 2)))))
+        }
+        res = str.Concat(res, str.Concat("\n", str.Concat(indentStr(indent), "}")))
+        return res
+    }
+    return json.MarshalValue(v)
+}
+
+// indentStr returns a string of n space characters.
+fn indentStr(n: int) -> string {
+    res := ""
+    for i := 0; i < n; i = i + 1 {
+        res = str.Concat(res, " ")
+    }
+    return res
+}

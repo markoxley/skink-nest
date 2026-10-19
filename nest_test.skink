@@ -1,0 +1,647 @@
+// Copyright 2026 Mark Oxley. All rights reserved.
+//
+// Project: Skink — A self-hosted, statically-typed programming language
+//          targeting LLVM IR, designed for systems programming with
+//          modern ergonomics and a Go-inspired syntax.
+//
+// File:    skinknest/nest_test.skink
+// Purpose: Tests for the nest configuration module — environment variable
+//          loading, JSON/YAML/XML file loading, precedence ordering,
+//          ListEnvironmentVariables, and CreateDefaultConfig. Mirrors the
+//          Go nest test suite.
+// Author:  Mark Oxley
+// Created: 2026
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+module nest_test
+
+import "nest"
+import "testing"
+import "std/fs"
+import "std/os"
+import "std/path"
+import "std/reflect"
+
+// TestConfig mirrors the Go TestConfig: a default-bearing field, a plain
+// env field, and an excluded field.
+struct TestConfig {
+    [env(NEST_NAME,default_name)]
+    name: string
+    [env(NEST_ENDPOINT)]
+    endpoint: string
+    [env(-)]
+    skipped: string
+}
+
+// DatabaseCfg is a registered nested section type.
+struct DatabaseCfg {
+    [env(HOST,localhost)]
+    host: string
+    [env(PORT,5432)]
+    port: string
+}
+
+// ApiCfg is a second registered nested section type.
+struct ApiCfg {
+    [env(API_KEY)]
+    key: string
+}
+
+// NestedConfig mirrors the Go NestedConfig.
+struct NestedConfig {
+    database: DatabaseCfg
+    api: ApiCfg
+}
+
+// PtrConfig keeps a [nest(ptr)] marker on its *Struct field — the marker is
+// now optional (pointer fields are auto-detected) but must remain accepted.
+struct PtrConfig {
+    [nest(ptr)]
+    database: *DatabaseCfg
+}
+
+// FileConfig mirrors the Go FileConfig with json/yaml names.
+struct FileConfig {
+    [env(NEST_FILE_NAME,name_default)] [json(name)] [yaml(name)]
+    name: string
+    [env(NEST_FILE_ENDPOINT)] [json(endpoint)] [yaml(endpoint)]
+    endpoint: string
+    [env(NEST_FILE_REGION,us-east-1)] [json(region)] [yaml(region)]
+    region: string
+}
+
+// TypedConfig exercises non-string field types loaded from env, defaults,
+// and config files.
+struct TypedConfig {
+    [env(NEST_DEBUG,false)] [json(debug)] [yaml(debug)]
+    debug: bool
+    [env(NEST_WORKERS,4)] [json(workers)] [yaml(workers)]
+    workers: int
+    [env(NEST_RATIO,0.5)] [json(ratio)] [yaml(ratio)]
+    ratio: float
+}
+
+// ServerSection is a nested section used by CreateDefaultConfig tests.
+struct ServerSection {
+    [env(SRV_HOST,localhost)] [json(host)] [yaml(host)]
+    host: string
+    [env(SRV_PORT,8080)] [json(port)] [yaml(port)]
+    port: string
+}
+
+// NestedFileConfig mirrors the Go NestedFileConfig for default generation.
+struct NestedFileConfig {
+    [json(server)] [yaml(server)]
+    server: ServerSection
+    [env(DEBUG,false)] [json(debug)] [yaml(debug)]
+    debug: bool
+}
+
+const testDir = "/tmp/skinknest_test"
+
+// registerNested registers all nested section types used by the tests.
+// Register is idempotent, so calling it per-test is safe.
+fn registerNested() {
+    nest.Register(reflect.TypeOf<DatabaseCfg>(DatabaseCfg{host: "", port: ""}))
+    nest.Register(reflect.TypeOf<ApiCfg>(ApiCfg{key: ""}))
+    nest.Register(reflect.TypeOf<ServerSection>(ServerSection{host: "", port: ""}))
+}
+
+// clearFileEnv unsets every environment variable used by FileConfig tests.
+fn clearFileEnv() {
+    os.Unsetenv("NEST_FILE_NAME")
+    os.Unsetenv("NEST_FILE_ENDPOINT")
+    os.Unsetenv("NEST_FILE_REGION")
+}
+
+// clearTypedEnv unsets the environment variables used by TypedConfig tests.
+fn clearTypedEnv() {
+    os.Unsetenv("NEST_DEBUG")
+    os.Unsetenv("NEST_WORKERS")
+    os.Unsetenv("NEST_RATIO")
+}
+
+// writeTestFile writes content under testDir and returns the full path.
+fn writeTestFile(name: string, content: string) -> string {
+    fs.Mkdir(testDir)
+    p := path.Join([]string{testDir, name})
+    fs.WriteAll(p, content)
+    return p
+}
+
+// TestEnvDefaults verifies tag defaults are applied when env vars are unset.
+pub fn TestEnvDefaults() {
+    os.Unsetenv("NEST_NAME")
+    os.Unsetenv("NEST_ENDPOINT")
+    var cfg TestConfig
+    t := reflect.TypeOf<TestConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{})
+    testing.AssertEqualString("", err.message, "Load should succeed")
+    testing.AssertEqualString("default_name", cfg.name, "default applied")
+    testing.AssertEqualString("", cfg.endpoint, "no default stays empty")
+}
+
+// TestEnvOverrides verifies environment variables win over tag defaults.
+pub fn TestEnvOverrides() {
+    os.Setenv("NEST_NAME", "from_env")
+    os.Setenv("NEST_ENDPOINT", "http://example.com")
+    var cfg TestConfig
+    t := reflect.TypeOf<TestConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{})
+    os.Unsetenv("NEST_NAME")
+    os.Unsetenv("NEST_ENDPOINT")
+    testing.AssertEqualString("", err.message, "Load should succeed")
+    testing.AssertEqualString("from_env", cfg.name, "env wins over default")
+    testing.AssertEqualString("http://example.com", cfg.endpoint, "env loaded")
+}
+
+// TestEnvSkipped verifies [env(-)] fields are never loaded or defaulted.
+pub fn TestEnvSkipped() {
+    os.Setenv("NEST_SKIPPED", "should_not_set")
+    var cfg TestConfig
+    cfg.skipped = "original"
+    t := reflect.TypeOf<TestConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{})
+    os.Unsetenv("NEST_SKIPPED")
+    testing.AssertEqualString("", err.message, "Load should succeed")
+    testing.AssertEqualString("original", cfg.skipped, "env(-) field untouched")
+}
+
+// TestEnvPrefix verifies the top-level prefix is applied to env var names.
+pub fn TestEnvPrefix() {
+    os.Setenv("PFX_NEST_NAME", "prefixed_name")
+    var cfg TestConfig
+    t := reflect.TypeOf<TestConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "PFX", []string{})
+    os.Unsetenv("PFX_NEST_NAME")
+    testing.AssertEqualString("", err.message, "Load should succeed")
+    testing.AssertEqualString("prefixed_name", cfg.name, "prefix applied")
+}
+
+// TestNestedEnv verifies nested registered structs get prefixed env names.
+pub fn TestNestedEnv() {
+    registerNested()
+    os.Setenv("DATABASE_HOST", "db.example.com")
+    os.Setenv("API_API_KEY", "secret123")
+    var cfg NestedConfig
+    t := reflect.TypeOf<NestedConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{})
+    os.Unsetenv("DATABASE_HOST")
+    os.Unsetenv("API_API_KEY")
+    testing.AssertEqualString("", err.message, "Load should succeed")
+    testing.AssertEqualString("db.example.com", cfg.database.host, "nested env")
+    testing.AssertEqualString("5432", cfg.database.port, "nested default")
+    testing.AssertEqualString("secret123", cfg.api.key, "nested env tag name")
+}
+
+// TestNestedEnvPrefix verifies prefix composes with nested section names.
+pub fn TestNestedEnvPrefix() {
+    registerNested()
+    os.Setenv("APP_DATABASE_HOST", "appdb.example.com")
+    var cfg NestedConfig
+    t := reflect.TypeOf<NestedConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "APP", []string{})
+    os.Unsetenv("APP_DATABASE_HOST")
+    testing.AssertEqualString("", err.message, "Load should succeed")
+    testing.AssertEqualString("appdb.example.com", cfg.database.host, "prefixed nested env")
+}
+
+// TestPtrStructField verifies a nil *Struct field marked [nest(ptr)] is
+// allocated and populated with defaults.
+pub fn TestPtrStructField() {
+    registerNested()
+    os.Unsetenv("DATABASE_HOST")
+    var cfg PtrConfig
+    t := reflect.TypeOf<PtrConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{})
+    testing.AssertEqualString("", err.message, "Load should succeed")
+    testing.AssertNotNil(cfg.database, "ptr field should be initialized")
+    testing.AssertEqualString("localhost", cfg.database.host, "ptr field default")
+}
+
+// UnmarkedPtrConfig has a *Struct field without [nest(ptr)] — reflected
+// type names distinguish "*T" pointers from "[]T" slices, so pointer fields
+// are auto-detected without the marker.
+struct UnmarkedPtrConfig {
+    database: *DatabaseCfg
+}
+
+// SliceConfig has a []string field, which reports the reflected type name
+// "[]string" — now distinct from the "*string" a *string field reports.
+struct SliceConfig {
+    [env(SLICE_NAMES)]
+    names: []string
+}
+
+// MapConfig has a map field, which reports "map[string]int".
+struct MapConfig {
+    [env(MAP_FIELD)]
+    m: map[string]int
+}
+
+// TestUnmarkedPtrField verifies a *Struct field without [nest(ptr)] is
+// auto-detected, allocated, and populated — now that reflected type names
+// distinguish "*T" pointer fields from "[]T" slice fields.
+pub fn TestUnmarkedPtrField() {
+    registerNested()
+    os.Unsetenv("DATABASE_HOST")
+    var cfg UnmarkedPtrConfig
+    t := reflect.TypeOf<UnmarkedPtrConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{})
+    testing.AssertEqualString("", err.message, "Load should succeed")
+    testing.AssertNotNil(cfg.database, "unmarked ptr field should be initialized")
+    testing.AssertEqualString("localhost", cfg.database.host, "unmarked ptr field default")
+}
+
+// TestUnmarkedPtrFieldJSON verifies auto-detection through the file loading
+// path, where a JSON object targets the unmarked "*T" field.
+pub fn TestUnmarkedPtrFieldJSON() {
+    registerNested()
+    f := writeTestFile("unmarked.json", `{"database": {"host": "h"}}`)
+    var cfg UnmarkedPtrConfig
+    t := reflect.TypeOf<UnmarkedPtrConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{f})
+    testing.AssertEqualString("", err.message, "Load should succeed")
+    testing.AssertNotNil(cfg.database, "unmarked ptr field should be initialized")
+    testing.AssertEqualString("h", cfg.database.host, "file value loaded")
+}
+
+// TestSliceFieldUnsupported verifies a []T slice field — reflected as "[]T",
+// distinct from a "*T" pointer — is rejected as unsupported rather than
+// having a scalar written into its slice-header slot.
+pub fn TestSliceFieldUnsupported() {
+    os.Setenv("SLICE_NAMES", "a,b")
+    var cfg SliceConfig
+    t := reflect.TypeOf<SliceConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{})
+    os.Unsetenv("SLICE_NAMES")
+    testing.AssertError(err.message, "slice field must error")
+    testing.AssertContains(err.message, "unsupported", "unsupported type message")
+    testing.AssertContains(err.message, "[]string", "error names the slice type")
+}
+
+// TestMapFieldUnsupported verifies a map field — reflected as "map[K]V" —
+// is rejected as unsupported rather than corrupted.
+pub fn TestMapFieldUnsupported() {
+    os.Setenv("MAP_FIELD", "x")
+    var cfg MapConfig
+    t := reflect.TypeOf<MapConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{})
+    os.Unsetenv("MAP_FIELD")
+    testing.AssertError(err.message, "map field must error")
+    testing.AssertContains(err.message, "map[string]int", "error names the map type")
+}
+
+// TestTypedEnv verifies int/float/bool fields are converted from env text.
+pub fn TestTypedEnv() {
+    clearTypedEnv()
+    os.Setenv("NEST_WORKERS", "16")
+    var cfg TypedConfig
+    t := reflect.TypeOf<TypedConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{})
+    os.Unsetenv("NEST_WORKERS")
+    testing.AssertEqualString("", err.message, "Load should succeed")
+    testing.AssertEqualInt(16, cfg.workers, "env int parsed")
+    testing.AssertEqualBool(false, cfg.debug, "default bool parsed")
+    testing.AssertEqualFloat(0.5, cfg.ratio, "default float parsed")
+}
+
+// TestNilConfig verifies a zero pointer produces an error.
+pub fn TestNilConfig() {
+    var cfg TestConfig
+    t := reflect.TypeOf<TestConfig>(cfg)
+    err := nest.Load(t, int64(0), "", []string{})
+    testing.AssertError(err.message, "nil config must error")
+    testing.AssertContains(err.message, "nil", "error mentions nil")
+}
+
+// TestUnregisteredStruct verifies a nested struct type that was never
+// registered produces a descriptive error.
+struct NeverRegistered {
+    [env(X,1)]
+    x: string
+}
+struct HoldsUnregistered {
+    inner: NeverRegistered
+}
+pub fn TestUnregisteredStruct() {
+    var cfg HoldsUnregistered
+    t := reflect.TypeOf<HoldsUnregistered>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{})
+    testing.AssertError(err.message, "unregistered struct must error")
+    testing.AssertContains(err.message, "unregistered", "error explains fix")
+}
+
+// TestLoadJSONFile verifies values load from a JSON file.
+pub fn TestLoadJSONFile() {
+    clearFileEnv()
+    f := writeTestFile("config.json", `{"name": "from_json", "endpoint": "http://json.api.com", "region": "eu-west-1"}`)
+    var cfg FileConfig
+    t := reflect.TypeOf<FileConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{f})
+    testing.AssertEqualString("", err.message, "Load should succeed")
+    testing.AssertEqualString("from_json", cfg.name, "json name")
+    testing.AssertEqualString("http://json.api.com", cfg.endpoint, "json endpoint")
+    testing.AssertEqualString("eu-west-1", cfg.region, "json region")
+}
+
+// TestLoadYAMLFile verifies values load from a YAML file.
+pub fn TestLoadYAMLFile() {
+    clearFileEnv()
+    f := writeTestFile("config.yaml", "name: from_yaml\nendpoint: http://yaml.api.com\nregion: ap-south-1\n")
+    var cfg FileConfig
+    t := reflect.TypeOf<FileConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{f})
+    testing.AssertEqualString("", err.message, "Load should succeed")
+    testing.AssertEqualString("from_yaml", cfg.name, "yaml name")
+    testing.AssertEqualString("http://yaml.api.com", cfg.endpoint, "yaml endpoint")
+    testing.AssertEqualString("ap-south-1", cfg.region, "yaml region")
+}
+
+// TestLoadYmlFile verifies the .yml extension alias works.
+pub fn TestLoadYmlFile() {
+    clearFileEnv()
+    f := writeTestFile("config.yml", "name: from_yml\n")
+    var cfg FileConfig
+    t := reflect.TypeOf<FileConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{f})
+    testing.AssertEqualString("", err.message, "Load should succeed")
+    testing.AssertEqualString("from_yml", cfg.name, "yml name")
+}
+
+// TestFileTakesPrecedence verifies file values beat env values.
+pub fn TestFileTakesPrecedence() {
+    clearFileEnv()
+    os.Setenv("NEST_FILE_NAME", "env_loses")
+    os.Setenv("NEST_FILE_REGION", "env-region")
+    f := writeTestFile("prec.json", `{"name": "file_wins", "endpoint": "http://file.api.com", "region": "file-region"}`)
+    var cfg FileConfig
+    t := reflect.TypeOf<FileConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{f})
+    os.Unsetenv("NEST_FILE_NAME")
+    os.Unsetenv("NEST_FILE_REGION")
+    testing.AssertEqualString("", err.message, "Load should succeed")
+    testing.AssertEqualString("file_wins", cfg.name, "file beats env")
+    testing.AssertEqualString("http://file.api.com", cfg.endpoint, "file endpoint")
+    testing.AssertEqualString("file-region", cfg.region, "file beats env")
+}
+
+// TestPartialFile verifies file only overwrites keys it contains.
+pub fn TestPartialFile() {
+    clearFileEnv()
+    os.Setenv("NEST_FILE_NAME", "original_name")
+    os.Setenv("NEST_FILE_REGION", "original_region")
+    f := writeTestFile("partial.json", `{"endpoint": "http://only-endpoint.api.com"}`)
+    var cfg FileConfig
+    t := reflect.TypeOf<FileConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{f})
+    os.Unsetenv("NEST_FILE_NAME")
+    os.Unsetenv("NEST_FILE_REGION")
+    testing.AssertEqualString("", err.message, "Load should succeed")
+    testing.AssertEqualString("original_name", cfg.name, "env retained")
+    testing.AssertEqualString("http://only-endpoint.api.com", cfg.endpoint, "file endpoint")
+    testing.AssertEqualString("original_region", cfg.region, "env retained")
+}
+
+// TestDefaultsRemain verifies defaults survive when env and file are silent.
+pub fn TestDefaultsRemain() {
+    clearFileEnv()
+    f := writeTestFile("partial2.json", `{"endpoint": "http://partial.api.com"}`)
+    var cfg FileConfig
+    t := reflect.TypeOf<FileConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{f})
+    testing.AssertEqualString("", err.message, "Load should succeed")
+    testing.AssertEqualString("name_default", cfg.name, "default kept")
+    testing.AssertEqualString("http://partial.api.com", cfg.endpoint, "file endpoint")
+    testing.AssertEqualString("us-east-1", cfg.region, "default kept")
+}
+
+// TestEmptyJSON verifies an empty JSON object changes nothing.
+pub fn TestEmptyJSON() {
+    clearFileEnv()
+    f := writeTestFile("empty.json", "{}")
+    var cfg FileConfig
+    t := reflect.TypeOf<FileConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{f})
+    testing.AssertEqualString("", err.message, "Load should succeed")
+    testing.AssertEqualString("name_default", cfg.name, "default kept")
+    testing.AssertEqualString("", cfg.endpoint, "no default stays empty")
+    testing.AssertEqualString("us-east-1", cfg.region, "default kept")
+}
+
+// TestLoadXMLFile verifies values load from an XML file.
+pub fn TestLoadXMLFile() {
+    clearFileEnv()
+    f := writeTestFile("cfg.xml", "<FileConfig><Name>xml_name</Name><Endpoint>http://xml.api.com</Endpoint></FileConfig>")
+    var cfg FileConfig
+    t := reflect.TypeOf<FileConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{f})
+    testing.AssertEqualString("", err.message, "Load should succeed")
+    testing.AssertEqualString("xml_name", cfg.name, "xml name")
+    testing.AssertEqualString("http://xml.api.com", cfg.endpoint, "xml endpoint")
+}
+
+// TestExplicitFileType verifies a second filename argument overrides the
+// detected type, accepting bare type names ("json" as well as ".json").
+pub fn TestExplicitFileType() {
+    clearFileEnv()
+    f := writeTestFile("myconfig", `{"name": "explicit_type"}`)
+    var cfg FileConfig
+    t := reflect.TypeOf<FileConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{f, "json"})
+    testing.AssertEqualString("", err.message, "Load should succeed")
+    testing.AssertEqualString("explicit_type", cfg.name, "explicit type used")
+}
+
+// TestUnsupportedFileType verifies an unknown extension is an error.
+pub fn TestUnsupportedFileType() {
+    clearFileEnv()
+    f := writeTestFile("config.txt", "name=test")
+    var cfg FileConfig
+    t := reflect.TypeOf<FileConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{f})
+    testing.AssertError(err.message, "unsupported type must error")
+    testing.AssertContains(err.message, "unsupported", "error names the problem")
+}
+
+// TestMissingFile verifies a missing config file is an error.
+pub fn TestMissingFile() {
+    clearFileEnv()
+    var cfg FileConfig
+    t := reflect.TypeOf<FileConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{"/tmp/skinknest_test/does_not_exist.json"})
+    testing.AssertError(err.message, "missing file must error")
+    testing.AssertContains(err.message, "does_not_exist.json", "error names file")
+}
+
+// TestInvalidJSON verifies malformed JSON is an error.
+pub fn TestInvalidJSON() {
+    clearFileEnv()
+    f := writeTestFile("bad.json", "{{bad}}")
+    var cfg FileConfig
+    t := reflect.TypeOf<FileConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{f})
+    testing.AssertError(err.message, "bad JSON must error")
+}
+
+// TestJSONTypeMismatch verifies a JSON value of the wrong kind is an error,
+// matching Go's unmarshal-type error.
+pub fn TestJSONTypeMismatch() {
+    clearFileEnv()
+    f := writeTestFile("badtype.json", `{"name": 123}`)
+    var cfg FileConfig
+    t := reflect.TypeOf<FileConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{f})
+    testing.AssertError(err.message, "type mismatch must error")
+}
+
+// TestTypedJSON verifies typed fields load from JSON numbers and bools.
+pub fn TestTypedJSON() {
+    clearTypedEnv()
+    f := writeTestFile("typed.json", `{"debug": true, "workers": 8, "ratio": 1.5}`)
+    var cfg TypedConfig
+    t := reflect.TypeOf<TypedConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{f})
+    testing.AssertEqualString("", err.message, "Load should succeed")
+    testing.AssertEqualBool(true, cfg.debug, "json bool")
+    testing.AssertEqualInt(8, cfg.workers, "json int")
+    testing.AssertEqualFloat(1.5, cfg.ratio, "json float")
+}
+
+// TestTypedYAML verifies typed fields load from YAML scalars.
+pub fn TestTypedYAML() {
+    clearTypedEnv()
+    f := writeTestFile("typed.yaml", "debug: true\nworkers: 12\nratio: 2\n")
+    var cfg TypedConfig
+    t := reflect.TypeOf<TypedConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{f})
+    testing.AssertEqualString("", err.message, "Load should succeed")
+    testing.AssertEqualBool(true, cfg.debug, "yaml bool")
+    testing.AssertEqualInt(12, cfg.workers, "yaml int")
+    testing.AssertEqualFloat(2.0, cfg.ratio, "yaml float")
+}
+
+// TestBadIntEnv verifies a non-numeric env value for an int field errors.
+pub fn TestBadIntEnv() {
+    clearTypedEnv()
+    os.Setenv("NEST_WORKERS", "notanumber")
+    var cfg TypedConfig
+    t := reflect.TypeOf<TypedConfig>(cfg)
+    err := nest.Load(t, int64(&cfg), "", []string{})
+    os.Unsetenv("NEST_WORKERS")
+    testing.AssertError(err.message, "bad int env must error")
+    testing.AssertContains(err.message, "workers", "error names field")
+}
+
+// TestListEnvVars verifies basic env var listing with defaults.
+pub fn TestListEnvVars() {
+    registerNested()
+    var cfg FileConfig
+    t := reflect.TypeOf<FileConfig>(cfg)
+    m, err := nest.ListEnvironmentVariables(t, "")
+    testing.AssertEqualString("", err.message, "list should succeed")
+    testing.AssertEqualString("name_default", m["NEST_FILE_NAME"], "name default listed")
+    testing.AssertEqualString("", m["NEST_FILE_ENDPOINT"], "empty default listed")
+}
+
+// TestListEnvVarsNested verifies nested struct env names are prefixed.
+pub fn TestListEnvVarsNested() {
+    registerNested()
+    var cfg NestedConfig
+    t := reflect.TypeOf<NestedConfig>(cfg)
+    m, err := nest.ListEnvironmentVariables(t, "APP")
+    testing.AssertEqualString("", err.message, "list should succeed")
+    testing.AssertEqualString("localhost", m["APP_DATABASE_HOST"], "nested listed")
+    testing.AssertEqualString("5432", m["APP_DATABASE_PORT"], "nested listed")
+}
+
+// TestListEnvVarsNonStruct verifies a non-struct type yields an empty map.
+pub fn TestListEnvVarsNonStruct() {
+    t := reflect.TypeOf<int>(42)
+    m, err := nest.ListEnvironmentVariables(t, "")
+    testing.AssertEqualString("", err.message, "list should succeed")
+    testing.AssertEqualInt(0, len(m), "non-struct yields empty map")
+}
+
+// TestCreateDefaultJSON verifies default config generation and reload.
+pub fn TestCreateDefaultJSON() {
+    clearFileEnv()
+    f := path.Join([]string{testDir, "defaults.json"})
+    var cfg FileConfig
+    t := reflect.TypeOf<FileConfig>(cfg)
+    err := nest.CreateDefaultConfig(t, f, "")
+    testing.AssertEqualString("", err.message, "create should succeed")
+    content, rerr := fs.ReadAll(f)
+    testing.AssertEqualString("", rerr.message, "default file should exist")
+    testing.AssertContains(content, "name_default", "defaults written")
+    var loaded FileConfig
+    lt := reflect.TypeOf<FileConfig>(loaded)
+    lerr := nest.Load(lt, int64(&loaded), "", []string{f})
+    testing.AssertEqualString("", lerr.message, "reload should succeed")
+    testing.AssertEqualString("name_default", loaded.name, "reloaded name")
+    testing.AssertEqualString("", loaded.endpoint, "reloaded endpoint empty")
+    testing.AssertEqualString("us-east-1", loaded.region, "reloaded region")
+}
+
+// TestCreateDefaultYAML verifies YAML default config generation and reload.
+pub fn TestCreateDefaultYAML() {
+    clearFileEnv()
+    f := path.Join([]string{testDir, "defaults.yaml"})
+    var cfg FileConfig
+    t := reflect.TypeOf<FileConfig>(cfg)
+    err := nest.CreateDefaultConfig(t, f, "")
+    testing.AssertEqualString("", err.message, "create should succeed")
+    var loaded FileConfig
+    lt := reflect.TypeOf<FileConfig>(loaded)
+    lerr := nest.Load(lt, int64(&loaded), "", []string{f})
+    testing.AssertEqualString("", lerr.message, "reload should succeed")
+    testing.AssertEqualString("name_default", loaded.name, "reloaded yaml name")
+}
+
+// TestCreateDefaultExplicitType verifies filetype overrides the extension.
+pub fn TestCreateDefaultExplicitType() {
+    f := path.Join([]string{testDir, "mydefaults"})
+    var cfg FileConfig
+    t := reflect.TypeOf<FileConfig>(cfg)
+    err := nest.CreateDefaultConfig(t, f, "json")
+    testing.AssertEqualString("", err.message, "create should succeed")
+    content, rerr := fs.ReadAll(f)
+    testing.AssertEqualString("", rerr.message, "default file should exist")
+    testing.AssertContains(content, "name_default", "defaults written")
+}
+
+// TestCreateDefaultUnsupported verifies unknown/XML types are errors.
+pub fn TestCreateDefaultUnsupported() {
+    var cfg FileConfig
+    t := reflect.TypeOf<FileConfig>(cfg)
+    err := nest.CreateDefaultConfig(t, path.Join([]string{testDir, "x.txt"}), "")
+    testing.AssertError(err.message, "txt must error")
+    err2 := nest.CreateDefaultConfig(t, path.Join([]string{testDir, "x.xml"}), "")
+    testing.AssertError(err2.message, "xml must error")
+}
+
+// TestCreateDefaultNested verifies nested struct defaults become objects.
+pub fn TestCreateDefaultNested() {
+    registerNested()
+    f := path.Join([]string{testDir, "nested.json"})
+    var cfg NestedFileConfig
+    t := reflect.TypeOf<NestedFileConfig>(cfg)
+    err := nest.CreateDefaultConfig(t, f, "")
+    testing.AssertEqualString("", err.message, "create should succeed")
+    content, rerr := fs.ReadAll(f)
+    testing.AssertEqualString("", rerr.message, "default file should exist")
+    testing.AssertContains(content, "localhost", "nested host default")
+    testing.AssertContains(content, "8080", "nested port default")
+    testing.AssertContains(content, "server", "nested section key")
+}

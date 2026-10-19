@@ -1,0 +1,116 @@
+// Example program for the nest configuration library — a self-contained
+// tour of the loading pipeline: field-tag defaults, environment-variable
+// overrides, JSON file overrides, nested sections, *Struct pointer fields,
+// environment discovery, and default-config generation.
+//
+// Build and run from the repository root:
+//
+//   SKINK_HOME=<skink repo> <skink repo>/skink -o /tmp/nest_demo skinknest/main.skink
+//   /tmp/nest_demo
+module main
+
+import "nest"
+import "std/fs"
+import "std/os"
+import "std/reflect"
+
+// Database is a nested section. Its environment names are prefixed by the
+// field name it appears under ("database" -> DATABASE_HOST, DATABASE_PORT).
+struct Database {
+    [env(HOST,localhost)]
+    host: string
+    [env(PORT,5432)]
+    port: int
+}
+
+// Metrics is a pointer section: a nil *Metrics field is allocated and
+// zeroed automatically when the loaders recurse into it.
+struct Metrics {
+    [env(ENABLED,false)]
+    enabled: bool
+}
+
+struct Config {
+    [env(APP_NAME,nest-demo)] [json(name)]
+    name: string
+    [env(APP_DEBUG,false)] [json(debug)]
+    debug: bool
+    database: Database
+    metrics: *Metrics
+}
+
+// yn renders a bool for display (Skink has no bool->string cast).
+fn yn(b: bool) -> string {
+    if b {
+        return "true"
+    }
+    return "false"
+}
+
+fn main() -> int {
+    // Nested section types must be registered so the loaders can resolve a
+    // field's reflected type name back to field metadata.
+    nest.Register(reflect.TypeOf<Database>(Database{}))
+    nest.Register(reflect.TypeOf<Metrics>(Metrics{}))
+
+    var cfg Config
+    t := reflect.TypeOf<Config>(cfg)
+
+    // 1. Environment discovery — the variables nest would consult, with
+    // their tag defaults.
+    vars, lerr := nest.ListEnvironmentVariables(t, "")
+    if lerr.message != "" {
+        println("ListEnvironmentVariables failed: ", lerr.message)
+        return 1
+    }
+    println("Environment variables (name = default):")
+    for k, v in vars {
+        println("  ", k, " = ", v)
+    }
+
+    // 2. Write a partial config file — only the keys present are updated;
+    // everything else keeps its environment/default value.
+    cfgPath := "/tmp/nest_example.json"
+    fs.WriteAll(cfgPath, `{"name": "from-file", "database": {"port": 6543}}`)
+
+    // 3. Set environment overrides: env beats the tag default but loses to
+    // values present in the file.
+    os.Setenv("APP_NAME", "from-env")
+    os.Setenv("DATABASE_HOST", "db.internal")
+    os.Setenv("APP_DEBUG", "true")
+
+    // 4. Load: defaults < environment < file.
+    err := nest.Load(t, int64(&cfg), "", []string{cfgPath})
+    if err.message != "" {
+        println("Load failed: ", err.message)
+        return 1
+    }
+    println("")
+    println("Loaded configuration:")
+    println("  name          = ", cfg.name, "          (file wins over env \"from-env\")")
+    println("  debug         = ", yn(cfg.debug), "          (env wins over default false)")
+    println("  database.host = ", cfg.database.host, "    (env wins over default \"localhost\")")
+    println("  database.port = ", string(cfg.database.port), "          (file wins over default 5432)")
+    println("  metrics       = allocated:", yn(cfg.metrics != nil), ", enabled = ", yn(cfg.metrics.enabled), " (default)")
+
+    // 5. Default-config generation — a starter file built from the tags.
+    defPath := "/tmp/nest_defaults.json"
+    derr := nest.CreateDefaultConfig(t, defPath, "")
+    if derr.message != "" {
+        println("CreateDefaultConfig failed: ", derr.message)
+        return 1
+    }
+    data, rerr := fs.ReadAll(defPath)
+    if rerr.message != "" {
+        println("ReadAll failed: ", rerr.message)
+        return 1
+    }
+    println("")
+    println("Generated defaults (", defPath, "):")
+    println(data)
+
+    os.Unsetenv("APP_NAME")
+    os.Unsetenv("DATABASE_HOST")
+    os.Unsetenv("APP_DEBUG")
+    return 0
+}

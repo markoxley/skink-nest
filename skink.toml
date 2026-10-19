@@ -1,0 +1,16 @@
+# Skink Project Manifest (managed by scales)
+
+[package]
+name = "nest"
+version = "0.1.0"
+author = "mark"
+entry = "nest.skink"
+license = "Apache-2.0"
+
+[target]
+env = "std"
+no_std = false
+os = "any"
+arch = "any"
+
+[dependencies]
