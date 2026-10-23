@@ -24,17 +24,27 @@ Skink, adapted to Skink's compile-time reflection model.
 
 ## Using the module
 
-Copy `nest.skink` into your project, or place it on the module search path
-(vendor directory, `.skink/cache`, or alongside your sources):
+nest is distributed through `scales`, the Skink package manager. Inside a
+project directory (one containing a `skink.toml` — create one with
+`scales init` if needed):
 
-```
-yourproject/
-  vendor/
-    nest.skink        (or vendor/nest/nest.skink)
-  main.skink
+```bash
+scales add mod/markoxley/skink-nest            # latest, records it in skink.toml
+scales add mod/markoxley/skink-nest@v1.0.0     # pin a specific tag
 ```
 
-Then `import "nest"`.
+This fetches the package into the shared scales cache
+(`~/.local/skink/scales/packages/...`) and records it in `skink.toml` +
+`skink.lock`. `scales install` restores the cache on a fresh machine.
+
+Then import it by its module specifier — the import binds under the
+package's declared module name, `nest`:
+
+```skink
+import "mod/markoxley/skink-nest"
+
+err := nest.Load(t, int64(&cfg), "APP", []string{"config.json"})
+```
 
 ## Quick Start
 
