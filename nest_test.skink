@@ -645,3 +645,15 @@ pub fn TestCreateDefaultNested() {
     testing.AssertContains(content, "8080", "nested port default")
     testing.AssertContains(content, "server", "nested section key")
 }
+
+// TestMustLoad verifies the MustLoad convenience wrapper completes without
+// aborting when Load succeeds (the fatal path terminates the process and so
+// can only be exercised as a compile-time contract, not a unit test).
+pub fn TestMustLoad() {
+    os.Unsetenv("NEST_NAME")
+    os.Unsetenv("NEST_ENDPOINT")
+    var cfg TestConfig
+    t := reflect.TypeOf<TestConfig>(cfg)
+    nest.MustLoad(t, int64(&cfg), "", []string{})
+    testing.AssertEqualString("default_name", cfg.name, "MustLoad applies defaults")
+}
