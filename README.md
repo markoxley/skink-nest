@@ -51,7 +51,7 @@ err := nest.Load(t, int64(&cfg), "APP", []string{"config.json"})
 ```skink
 module main
 
-import "nest"
+import "mod/markoxley/skink-nest"
 import "std/errors"
 import "std/fs"
 import "std/io"
@@ -251,8 +251,11 @@ as in Go). XML element text is converted like environment text.
 
 ## Running the tests
 
+From this directory:
+
 ```bash
-SKINK_HOME=/path/to/skink skink -t skinknest
+bash run_tests.sh            # runs every *_test.skink suite
+skink -t nest_test.skink     # or run the single suite directly
 ```
 
 ## License
